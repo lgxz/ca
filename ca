@@ -1,0 +1,222 @@
+#!/bin/sh
+# by lgx@live.com 2005.03.09
+# Usage: ca init; ca server; ca client
+
+DB_DIR=db
+DB_CERTS_DIR=$DB_DIR/certs
+DB_SERIAL_FILE=$DB_DIR/serial
+DB_INDEX_FILE=$DB_DIR/index
+DB_RAND_FILE=$DB_DIR/rand
+CA_KEY_FILE=ca.key
+CA_CRT_FILE=ca.crt
+CONF_FILE=.config
+SERVER_DIR=server
+CLIENT_DIR=client
+
+OPENSSL=openssl
+CUR_SERIAL=0
+
+function info ()
+{
+	echo -e "\033[32m$1\033[0m"
+}
+
+function warn()
+{
+	echo -e "\033[33m$1\033[0m"
+}
+
+function error()
+{
+	echo -e "\033[31m$1\033[0m"
+	return 1
+}
+
+# 签名，生成证书
+#	$1 = 要签名的证书请求文件 (.csr)
+#	$2 = 输出的证书文件 (.crt)
+function sign ()
+{
+	info "CA signing: $1 -> $2"
+	$OPENSSL ca -config $CONF_FILE -out $2 -infiles $1
+
+	info "CA verifying: $2 <-> $CA_CRT_FILE"
+	$OPENSSL verify -CAfile $CA_CRT_FILE $2
+
+	rm -f $DB_SERIAL_FILE.old $DB_INDEX_FILE.old
+}
+
+# 初始化 CA 系统，生成 CA 根证书
+function init ()
+{
+	mkdir -p $DB_DIR
+	mkdir -p $DB_CERTS_DIR
+	mkdir -p $SERVER_DIR
+	mkdir -p $CLIENT_DIR
+
+	if [ ! -f $DB_SERIAL_FILE ]; then
+		echo '01' > $DB_SERIAL_FILE
+	fi
+
+	if [ ! -f $DB_INDEX_FILE ]; then
+		touch $DB_INDEX_FILE
+	fi
+
+	cat > $CONF_FILE << EOT
+[ ca ]
+default_ca              = CA_own
+[ CA_own ]
+dir                     = .
+certs                   = \$dir
+new_certs_dir           = \$dir/$DB_CERTS_DIR
+database                = \$dir/$DB_INDEX_FILE
+serial                  = \$dir/$DB_SERIAL_FILE
+RANDFILE                = \$dir/$DB_RAND_FILE
+certificate             = \$dir/$CA_CRT_FILE
+private_key             = \$dir/$CA_KEY_FILE
+default_days            = 3650
+default_crl_days        = 30
+default_md              = sha1
+preserve                = no
+policy                  = policy_anything
+string_mask				= utf8only
+extensions              = ssl_client
+[ policy_anything ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+[ req ]
+distinguished_name		= req_distinguished_name
+attributes				= req_attributes
+[ req_distinguished_name ]
+countryName				= Country Name (2 letter code)
+countryName_default		= CN
+stateOrProvinceName		= State or Province Name (full name)
+stateOrProvinceName_default	=	New York
+localityName			= Locality Name (eg, city)
+localityName_default	= New York
+0.organizationName		= Organization Name (eg, company)
+0.organizationName_default	= Microsoft Corp.
+organizationalUnitName	= Organizational Unit Name (eg, section)
+#organizationalUnitName_default	=
+commonName				= Common Name (eg, YOUR name)
+commonName_max			= 64
+emailAddress			= Email Address
+emailAddress_max		= 64
+[ req_attributes ]
+challengePassword		= A challenge password
+challengePassword_min	= 4
+challengePassword_max	= 20
+unstructuredName		= An optional company name
+unstructuredName_default	= Microsoft
+EOT
+
+	info "CREATE CA KEY"
+	$OPENSSL genrsa -aes256 -out $CA_KEY_FILE 2048
+	info "CREATE CA CRT"
+	$OPENSSL req -config $CONF_FILE -new -x509 -days 7300 -key $CA_KEY_FILE -out $CA_CRT_FILE
+}
+
+# 生成 WWW 服务器用的证书
+function server ()
+{
+	SERVER_KEY_FILE=$SERVER_DIR/$CUR_SERIAL.key
+	SERVER_KEY_FILE2=$SERVER_DIR/$CUR_SERIAL.key.unsecure
+	SERVER_CSR_FILE=$SERVER_DIR/$CUR_SERIAL.csr
+	SERVER_CRT_FILE=$SERVER_DIR/$CUR_SERIAL.crt
+
+	info "CREATE SERVER KEY FILE"
+	$OPENSSL genrsa -aes256 -out $SERVER_KEY_FILE 2048
+
+	info "CREATE UNSECURE SERVER KEY FILE"
+	openssl rsa -in $SERVER_KEY_FILE -out $SERVER_KEY_FILE2
+
+	info "CREATE SERVER CERT REQUEST"
+	$OPENSSL req -config $CONF_FILE -new -key $SERVER_KEY_FILE -out $SERVER_CSR_FILE
+
+	info "SIGN AND CREATE SERVER CRT FILE"
+	sign $SERVER_CSR_FILE $SERVER_CRT_FILE
+}
+
+# 生成客户端证书 (PKCS12 格式)
+function client ()
+{
+	CLIENT_KEY_FILE=$CLIENT_DIR/$CUR_SERIAL.key
+	CLIENT_CSR_FILE=$CLIENT_DIR/$CUR_SERIAL.csr
+	CLIENT_CRT_FILE=$CLIENT_DIR/$CUR_SERIAL.crt
+	CLIENT_P12_FILE=$CLIENT_DIR/$CUR_SERIAL.p12
+
+	info "CREATE CLIENT KEY FILE"
+	$OPENSSL genrsa -aes256 -out $CLIENT_KEY_FILE 2048
+
+	info "CREATE CLIENT CERT REQUEST"
+	$OPENSSL req -config $CONF_FILE -new -key $CLIENT_KEY_FILE -out $CLIENT_CSR_FILE
+
+	info "SIGN AND CREATE CLIENT CRT FILE"
+	sign $CLIENT_CSR_FILE $CLIENT_CRT_FILE
+
+	info "EXPORT TO PKCS#12 FORMAT"
+	$OPENSSL pkcs12 -export -aes256 -in $CLIENT_CRT_FILE -inkey $CLIENT_KEY_FILE -out $CLIENT_P12_FILE
+}
+
+# 清除证书系统，删除所有信息，仅保留此脚本
+function reset ()
+{
+	rm -rf $DB_CERTS_DIR $DB_SERIAL_FILE $DB_INDEX_FILE $CONF_FILE
+	rm -f $CA_CRT_FILE $CA_KEY_FILE
+	rm -rf $DB_DIR
+	rm -rf $SERVER_DIR $CLIENT_DIR
+}
+
+if [ $# -ne 1 ]
+then
+	error "Usage: $0 init|server|client|reset"
+	exit 1
+fi
+
+if [ "$1" != "init" ]; then
+	if [ ! -f $DB_INDEX_FILE ]; then
+		error "Please call 'init' firstly"
+		exit 1
+	fi
+
+	CUR_SERIAL=`cat $DB_SERIAL_FILE`
+fi
+
+case "$1" in
+	init)
+		info "INIT CA SYSTEM"
+		init
+		exit
+		;;
+	
+	server)
+		info "CREAT SERVER CERT"
+		server
+		exit
+		;;
+
+	client)
+		info "CREATE CLIENT CERT"
+		client
+		exit
+		;;
+	
+	reset)
+		info "RESET SYSTEM"
+		reset
+		exit
+		;;
+
+	*)
+		error "Usage: $0 init|server|client|reset"
+		exit 1
+esac
+
+exit 0
+
+
